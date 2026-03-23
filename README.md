@@ -42,10 +42,7 @@ Parse a session JSONL file and return structured data about what happened — in
 ## Installation
 
 ```bash
-# Clone and install the binary
-git clone https://github.com/iamngoni/mimir.git
-cd mimir
-cargo install --path .
+cargo install --git https://github.com/iamngoni/mimir
 ```
 
 ## MCP Configuration
