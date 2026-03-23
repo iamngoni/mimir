@@ -1,6 +1,6 @@
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::ServerInfo;
+use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -96,11 +96,12 @@ impl MimirServer {
 #[tool_handler]
 impl ServerHandler for MimirServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::default().with_instructions(
-            "Mimir — share session context between AI coding agents. \
-             Use list_sessions to discover sessions, then get_session_summary \
-             for details.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(
+                "Mimir — share session context between AI coding agents. \
+                 Use list_sessions to discover sessions, then get_session_summary \
+                 for details.",
+            )
     }
 }
 
