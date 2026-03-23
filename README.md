@@ -71,7 +71,11 @@ Or manually in `~/.claude.json`:
 ```
 
 ### Codex
-Add to `~/.codex/config.toml`:
+```bash
+codex mcp add mimir -- mimir
+```
+
+Or manually in `~/.codex/config.toml`:
 ```toml
 [mcp_servers.mimir]
 command = "mimir"
