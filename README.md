@@ -42,6 +42,11 @@ Parse a session JSONL file and return structured data about what happened — in
 ## Installation
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/iamngoni/mimir/master/install.sh | sh
+```
+
+Or if you have Rust installed:
+```bash
 cargo install --git https://github.com/iamngoni/mimir
 ```
 
