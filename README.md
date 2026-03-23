@@ -42,22 +42,44 @@ Parse a session JSONL file and return structured data about what happened — in
 ## Installation
 
 ```bash
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/iamngoni/mimir/master/install.sh | sh
+```
+
+Or if you have Rust installed:
+```bash
+cargo install --git https://github.com/iamngoni/mimir
 ```
 
 ## MCP Configuration
 
-Add to your `~/.claude/claude_desktop_config.json` or Codex MCP config:
+### Claude Code
+```bash
+claude mcp add mimir --transport stdio -- mimir
+```
 
+Or manually in `~/.claude.json`:
 ```json
 {
   "mcpServers": {
     "mimir": {
+      "type": "stdio",
       "command": "mimir",
       "args": []
     }
   }
 }
+```
+
+### Codex
+```bash
+codex mcp add mimir -- mimir
+```
+
+Or manually in `~/.codex/config.toml`:
+```toml
+[mcp_servers.mimir]
+command = "mimir"
+args = []
 ```
 
 ## Tech Stack

@@ -322,6 +322,11 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+<<<<<<< HEAD
+=======
+ "tracing",
+ "tracing-subscriber",
+>>>>>>> 29b7a0d3e0f0a5b265d02d960bff9ea52d363bad
  "walkdir",
 ]
 
