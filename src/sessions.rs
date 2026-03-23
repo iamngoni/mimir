@@ -53,8 +53,9 @@ fn discover_claude_code_sessions(project_path: &str) -> Result<Vec<SessionInfo>>
     Ok(sessions)
 }
 
-/// Discover Codex session files. Codex doesn't organize by project,
-/// so we return all sessions and let callers filter if needed.
+/// Discover Codex session files. Codex stores sessions in a `YYYY/MM/DD/` directory hierarchy.
+/// Each session file contains a `session_meta` entry with `id` and `cwd` fields.
+/// Sessions are filtered by `project_path` using the `cwd` from session metadata.
 fn discover_codex_sessions(project_path: &str) -> Result<Vec<SessionInfo>> {
     let home = home_dir()?;
     let sessions_dir = home.join(".codex").join("sessions");
@@ -64,26 +65,74 @@ fn discover_codex_sessions(project_path: &str) -> Result<Vec<SessionInfo>> {
     }
 
     let mut sessions = Vec::new();
-    for entry in WalkDir::new(&sessions_dir).max_depth(1).into_iter().flatten() {
+    for entry in WalkDir::new(&sessions_dir).into_iter().flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                let modified_at = fs::metadata(path)
-                    .and_then(|m| m.modified())
-                    .map(DateTime::<Utc>::from)
-                    .unwrap_or_default();
+            let modified_at = fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map(DateTime::<Utc>::from)
+                .unwrap_or_default();
 
-                sessions.push(SessionInfo {
-                    session_id: stem.to_string(),
-                    agent: Agent::Codex,
-                    project_path: project_path.to_string(),
-                    modified_at,
-                    file_path: path.to_string_lossy().to_string(),
-                });
+            // Read the session_meta entry to get the real session ID and cwd
+            let (session_id, cwd) = extract_codex_session_meta(path);
+            let session_id = session_id.unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
+
+            // Filter by project_path: match if cwd starts with the project path
+            let session_project = cwd.as_deref().unwrap_or("");
+            if !session_project.is_empty() && !session_project.starts_with(project_path) {
+                continue;
             }
+
+            sessions.push(SessionInfo {
+                session_id,
+                agent: Agent::Codex,
+                project_path: cwd.unwrap_or_else(|| project_path.to_string()),
+                modified_at,
+                file_path: path.to_string_lossy().to_string(),
+            });
         }
     }
     Ok(sessions)
+}
+
+/// Extract session ID and cwd from the session_meta entry in a Codex JSONL file.
+/// The session_meta entry is typically the first line, so we only read the first
+/// few lines to avoid reading entire large session files during discovery.
+fn extract_codex_session_meta(path: &Path) -> (Option<String>, Option<String>) {
+    use std::io::{BufRead, BufReader};
+
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (None, None),
+    };
+
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(5) {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if entry.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
+            let payload = &entry["payload"];
+            let id = payload.get("id").and_then(|i| i.as_str()).map(String::from);
+            let cwd = payload.get("cwd").and_then(|c| c.as_str()).map(String::from);
+            return (id, cwd);
+        }
+    }
+    (None, None)
 }
 
 /// List all sessions for a project, optionally filtered by agent.
@@ -123,10 +172,29 @@ fn resolve_session_path(session_id: &str, agent: Agent, project_path: Option<&st
                 .join(&encoded)
                 .join(format!("{session_id}.jsonl")))
         }
-        Agent::Codex => Ok(home
-            .join(".codex")
-            .join("sessions")
-            .join(format!("{session_id}.jsonl"))),
+        Agent::Codex => {
+            // Codex sessions are in YYYY/MM/DD/ subdirectories with filenames
+            // like `rollout-DATE-UUID.jsonl`. Search for the session ID in filenames.
+            let sessions_dir = home.join(".codex").join("sessions");
+            for entry in WalkDir::new(&sessions_dir).into_iter().flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        // Match by exact stem or by embedded UUID
+                        if stem == session_id || stem.contains(session_id) {
+                            return Ok(path.to_path_buf());
+                        }
+                    }
+                    // Also check session_meta id inside the file
+                    let (meta_id, _) = extract_codex_session_meta(path);
+                    if meta_id.as_deref() == Some(session_id) {
+                        return Ok(path.to_path_buf());
+                    }
+                }
+            }
+            // Fallback to flat path for backwards compatibility
+            Ok(sessions_dir.join(format!("{session_id}.jsonl")))
+        }
     }
 }
 
@@ -261,6 +329,19 @@ fn parse_claude_code_session(path: &Path, session_id: &str, project_path: &str) 
 }
 
 /// Parse a Codex JSONL session file into a summary.
+///
+/// Codex JSONL format uses a wrapper structure where each line has:
+/// - `type`: "session_meta" | "response_item" | "event_msg" | "turn_context"
+/// - `payload`: the actual data, with its own `type` field
+///
+/// Key payload types within `response_item`:
+/// - `message`: with `role` and `content` (array of `{type: "text", text: "..."}`)
+/// - `function_call`: with `name`, `arguments` (JSON string), `call_id`
+/// - `function_call_output`: with `call_id`, `output`
+///
+/// Key payload types within `event_msg`:
+/// - `user_message`: with `message` field containing user input
+/// - `agent_message`: with `message` field containing agent commentary
 fn parse_codex_session(path: &Path, session_id: &str, project_path: &str) -> Result<SessionSummary> {
     let content = fs::read_to_string(path).context("Failed to read session file")?;
 
@@ -283,7 +364,7 @@ fn parse_codex_session(path: &Path, session_id: &str, project_path: &str) -> Res
             Err(_) => continue,
         };
 
-        // Try to extract a timestamp
+        // Extract timestamp from wrapper
         if started_at.is_none() {
             if let Some(ts) = entry.get("timestamp").and_then(|t| t.as_str()) {
                 started_at = DateTime::parse_from_rfc3339(ts).ok().map(|dt| dt.to_utc());
@@ -291,46 +372,80 @@ fn parse_codex_session(path: &Path, session_id: &str, project_path: &str) -> Res
         }
 
         let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let payload = &entry["payload"];
+        let payload_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         match entry_type {
-            "message" => {
-                let role = entry.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                let text = entry
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string();
+            "response_item" => {
+                match payload_type {
+                    "message" => {
+                        let role = payload.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                        let text = extract_codex_content_text(&payload["content"]);
 
-                if !text.is_empty() {
-                    if role == "user" && initial_prompt.is_none() {
-                        initial_prompt = Some(text.clone());
-                    }
-                    if role == "assistant" {
-                        final_assistant_message = Some(text.clone());
-                    }
-                    turns.push(Turn {
-                        role: role.to_string(),
-                        content: text,
-                    });
-                }
-            }
-            "function_call" => {
-                if let Some(name) = entry.get("name").and_then(|n| n.as_str()) {
-                    *tool_calls.entry(name.to_string()).or_insert(0) += 1;
-                    // Try to extract file paths from arguments
-                    if let Some(args) = entry.get("arguments").and_then(|a| a.as_str()) {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
-                            extract_files_from_tool_input(name, &parsed, &mut files_touched);
+                        if !text.is_empty() {
+                            if role == "user" && initial_prompt.is_none() {
+                                initial_prompt = Some(text.clone());
+                            }
+                            if role == "assistant" {
+                                final_assistant_message = Some(text.clone());
+                            }
+                            turns.push(Turn {
+                                role: role.to_string(),
+                                content: text,
+                            });
                         }
                     }
+                    "function_call" | "custom_tool_call" => {
+                        let name_key = if payload_type == "function_call" { "name" } else { "name" };
+                        if let Some(name) = payload.get(name_key).and_then(|n| n.as_str()) {
+                            *tool_calls.entry(name.to_string()).or_insert(0) += 1;
+                            // function_call uses "arguments" (JSON string), custom_tool_call uses "input" (object)
+                            if let Some(args) = payload.get("arguments").and_then(|a| a.as_str()) {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
+                                    extract_files_from_tool_input(name, &parsed, &mut files_touched);
+                                }
+                            } else if let Some(input) = payload.get("input") {
+                                extract_files_from_tool_input(name, input, &mut files_touched);
+                            }
+                        }
+                    }
+                    "function_call_output" | "custom_tool_call_output" => {
+                        if let Some(output) = payload.get("output").and_then(|o| o.as_str()) {
+                            if output.contains("error") || output.contains("Error") {
+                                errors.push(output.chars().take(200).collect());
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            "function_call_output" => {
-                // Check for error indicators
-                if let Some(output) = entry.get("output").and_then(|o| o.as_str()) {
-                    if output.contains("error") || output.contains("Error") {
-                        errors.push(output.chars().take(200).collect());
+            "event_msg" => {
+                match payload_type {
+                    "user_message" => {
+                        if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
+                            if !msg.is_empty() {
+                                if initial_prompt.is_none() {
+                                    initial_prompt = Some(msg.to_string());
+                                }
+                                turns.push(Turn {
+                                    role: "user".to_string(),
+                                    content: msg.to_string(),
+                                });
+                            }
+                        }
                     }
+                    "agent_message" => {
+                        if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
+                            if !msg.is_empty() {
+                                final_assistant_message = Some(msg.to_string());
+                                turns.push(Turn {
+                                    role: "assistant".to_string(),
+                                    content: msg.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -362,6 +477,27 @@ fn parse_codex_session(path: &Path, session_id: &str, project_path: &str) -> Res
         final_assistant_message,
         raw_turns: turns,
     })
+}
+
+/// Extract text from Codex content array.
+/// Codex messages use `content: [{type: "text", text: "..."}]` format.
+fn extract_codex_content_text(content: &serde_json::Value) -> String {
+    // Handle string content (older format)
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    // Handle array content (current format)
+    let mut parts = Vec::new();
+    if let Some(arr) = content.as_array() {
+        for item in arr {
+            if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                    parts.push(t.to_string());
+                }
+            }
+        }
+    }
+    parts.join("\n")
 }
 
 /// Get a full summary of a session.
