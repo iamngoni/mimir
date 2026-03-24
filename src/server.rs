@@ -14,7 +14,7 @@ use crate::sessions;
 pub struct ListSessionsRequest {
     /// Absolute path to the project directory
     pub project_path: String,
-    /// Filter by agent: "claude-code", "codex", or omit for both
+    /// Filter by agent: "claude-code", "codex", "gemini", or omit for all
     pub agent: Option<String>,
 }
 
@@ -22,7 +22,7 @@ pub struct ListSessionsRequest {
 pub struct GetSessionSummaryRequest {
     /// The session ID (UUID stem of the JSONL file)
     pub session_id: String,
-    /// Which agent: "claude-code" or "codex"
+    /// Which agent: "claude-code", "codex", or "gemini"
     pub agent: String,
     /// Absolute project path (required for claude-code sessions)
     pub project_path: Option<String>,
@@ -39,7 +39,10 @@ fn parse_agent(s: &str) -> Result<Agent, String> {
     match s {
         "claude-code" => Ok(Agent::ClaudeCode),
         "codex" => Ok(Agent::Codex),
-        other => Err(format!("Unknown agent: {other}. Use \"claude-code\" or \"codex\".")),
+        "gemini" => Ok(Agent::Gemini),
+        other => Err(format!(
+            "Unknown agent: {other}. Use \"claude-code\", \"codex\", or \"gemini\"."
+        )),
     }
 }
 

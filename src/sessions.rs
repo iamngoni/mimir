@@ -135,6 +135,99 @@ fn extract_codex_session_meta(path: &Path) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
+/// Resolve a project path to a Gemini project alias using `~/.gemini/projects.json`.
+/// Returns None if no mapping exists for the given project path.
+fn resolve_gemini_project_alias(project_path: &str) -> Option<String> {
+    let home = home_dir().ok()?;
+    let projects_file = home.join(".gemini").join("projects.json");
+    let content = fs::read_to_string(projects_file).ok()?;
+    let data: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let projects = data.get("projects")?.as_object()?;
+
+    // Try exact match first, then prefix match
+    for (path, alias) in projects {
+        if path == project_path {
+            return alias.as_str().map(String::from);
+        }
+    }
+    for (path, alias) in projects {
+        if project_path.starts_with(path.as_str()) {
+            return alias.as_str().map(String::from);
+        }
+    }
+    None
+}
+
+/// Discover Gemini CLI session files for a given project path.
+/// Gemini stores sessions in `~/.gemini/tmp/<project-alias>/chats/session-*.json`.
+/// The project alias is resolved via `~/.gemini/projects.json`.
+fn discover_gemini_sessions(project_path: &str) -> Result<Vec<SessionInfo>> {
+    let home = home_dir()?;
+
+    let alias = match resolve_gemini_project_alias(project_path) {
+        Some(a) => a,
+        None => return Ok(vec![]),
+    };
+
+    let chats_dir = home.join(".gemini").join("tmp").join(&alias).join("chats");
+    if !chats_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut sessions = Vec::new();
+    for entry in WalkDir::new(&chats_dir).max_depth(1).into_iter().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let modified_at = fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map(DateTime::<Utc>::from)
+                .unwrap_or_default();
+
+            // Extract session ID from the JSON file content
+            let session_id = extract_gemini_session_id(path).unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
+
+            sessions.push(SessionInfo {
+                session_id,
+                agent: Agent::Gemini,
+                project_path: project_path.to_string(),
+                modified_at,
+                file_path: path.to_string_lossy().to_string(),
+            });
+        }
+    }
+    Ok(sessions)
+}
+
+/// Extract the session ID from a Gemini session JSON file.
+fn extract_gemini_session_id(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+
+    // The sessionId is near the top of the JSON file. Read enough to find it.
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(10) {
+        let line = line.ok()?;
+        if line.contains("\"sessionId\"") {
+            // Parse "sessionId": "UUID"
+            if let Some(start) = line.find("\"sessionId\"") {
+                let rest = &line[start..];
+                if let Some(colon) = rest.find(':') {
+                    let value = rest[colon + 1..].trim().trim_matches(|c: char| c == '"' || c == ',');
+                    if !value.is_empty() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// List all sessions for a project, optionally filtered by agent.
 pub fn list_sessions(project_path: &str, agent: Option<Agent>) -> Result<Vec<SessionInfo>> {
     let mut sessions = Vec::new();
@@ -146,9 +239,13 @@ pub fn list_sessions(project_path: &str, agent: Option<Agent>) -> Result<Vec<Ses
         Some(Agent::Codex) => {
             sessions.extend(discover_codex_sessions(project_path)?);
         }
+        Some(Agent::Gemini) => {
+            sessions.extend(discover_gemini_sessions(project_path)?);
+        }
         None => {
             sessions.extend(discover_claude_code_sessions(project_path)?);
             sessions.extend(discover_codex_sessions(project_path)?);
+            sessions.extend(discover_gemini_sessions(project_path)?);
         }
     }
 
@@ -194,6 +291,31 @@ fn resolve_session_path(session_id: &str, agent: Agent, project_path: Option<&st
             }
             // Fallback to flat path for backwards compatibility
             Ok(sessions_dir.join(format!("{session_id}.jsonl")))
+        }
+        Agent::Gemini => {
+            // Gemini sessions are in ~/.gemini/tmp/<alias>/chats/session-*.json
+            // Search all project aliases for the session ID.
+            let gemini_tmp = home.join(".gemini").join("tmp");
+            if gemini_tmp.exists() {
+                for entry in WalkDir::new(&gemini_tmp).into_iter().flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("json")
+                        && path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("chats")
+                    {
+                        // Check if filename contains the session ID
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            if stem.contains(session_id) {
+                                return Ok(path.to_path_buf());
+                            }
+                        }
+                        // Check sessionId inside the file
+                        if extract_gemini_session_id(path).as_deref() == Some(session_id) {
+                            return Ok(path.to_path_buf());
+                        }
+                    }
+                }
+            }
+            anyhow::bail!("Gemini session not found: {session_id}")
         }
     }
 }
@@ -500,6 +622,134 @@ fn extract_codex_content_text(content: &serde_json::Value) -> String {
     parts.join("\n")
 }
 
+/// Parse a Gemini CLI session JSON file into a summary.
+///
+/// Gemini uses a single JSON object (not JSONL) with:
+/// - `sessionId`, `startTime`, `lastUpdated`
+/// - `messages[]` with `type: "user" | "gemini" | "info"`
+/// - User messages have `content: [{text: "..."}]`
+/// - Gemini messages have `content: "..."` (string), `toolCalls[]`, `thoughts[]`
+/// - Tool calls: `{name, args, result, status}`
+fn parse_gemini_session(path: &Path, session_id: &str, project_path: &str) -> Result<SessionSummary> {
+    let content = fs::read_to_string(path).context("Failed to read session file")?;
+    let session: serde_json::Value = serde_json::from_str(&content).context("Failed to parse session JSON")?;
+
+    let mut turns = Vec::new();
+    let mut tool_calls: HashMap<String, usize> = HashMap::new();
+    let mut files_touched = Vec::new();
+    let mut errors = Vec::new();
+    let mut initial_prompt: Option<String> = None;
+    let mut final_assistant_message: Option<String> = None;
+
+    let started_at = session
+        .get("startTime")
+        .and_then(|t| t.as_str())
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.to_utc());
+
+    let messages = session.get("messages").and_then(|m| m.as_array());
+
+    if let Some(msgs) = messages {
+        for msg in msgs {
+            let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            match msg_type {
+                "user" => {
+                    // User content is an array of {text: "..."} objects
+                    let text = if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                        arr.iter()
+                            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        String::new()
+                    };
+
+                    if !text.is_empty() {
+                        if initial_prompt.is_none() {
+                            initial_prompt = Some(text.clone());
+                        }
+                        turns.push(Turn {
+                            role: "user".to_string(),
+                            content: text,
+                        });
+                    }
+                }
+                "gemini" => {
+                    // Gemini content is a plain string
+                    let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+
+                    if !text.is_empty() {
+                        final_assistant_message = Some(text.clone());
+                        turns.push(Turn {
+                            role: "assistant".to_string(),
+                            content: text,
+                        });
+                    }
+
+                    // Process tool calls
+                    if let Some(calls) = msg.get("toolCalls").and_then(|tc| tc.as_array()) {
+                        for call in calls {
+                            if let Some(name) = call.get("name").and_then(|n| n.as_str()) {
+                                *tool_calls.entry(name.to_string()).or_insert(0) += 1;
+
+                                // Extract file paths from args
+                                if let Some(args) = call.get("args") {
+                                    extract_files_from_tool_input(name, args, &mut files_touched);
+                                }
+
+                                // Check for errors in results
+                                if call.get("status").and_then(|s| s.as_str()) != Some("success") {
+                                    if let Some(result) = call.get("result").and_then(|r| r.as_array()) {
+                                        for r in result {
+                                            if let Some(resp) = r.get("functionResponse")
+                                                .and_then(|fr| fr.get("response"))
+                                                .and_then(|resp| resp.get("output"))
+                                                .and_then(|o| o.as_str())
+                                            {
+                                                if resp.contains("error") || resp.contains("Error") {
+                                                    errors.push(resp.chars().take(200).collect());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {} // Skip "info" and other types
+            }
+        }
+    }
+
+    files_touched.sort();
+    files_touched.dedup();
+
+    let tool_call_summaries: Vec<ToolCallSummary> = {
+        let mut v: Vec<_> = tool_calls
+            .into_iter()
+            .map(|(name, count)| ToolCallSummary { name, count })
+            .collect();
+        v.sort_by(|a, b| b.count.cmp(&a.count));
+        v
+    };
+
+    Ok(SessionSummary {
+        session_id: session_id.to_string(),
+        agent: Agent::Gemini,
+        project_path: project_path.to_string(),
+        started_at,
+        initial_prompt,
+        turn_count: turns.len(),
+        tool_calls: tool_call_summaries,
+        files_touched,
+        errors,
+        final_assistant_message,
+        raw_turns: turns,
+    })
+}
+
 /// Get a full summary of a session.
 pub fn get_session_summary(
     session_id: &str,
@@ -517,6 +767,7 @@ pub fn get_session_summary(
     match agent {
         Agent::ClaudeCode => parse_claude_code_session(&path, session_id, project),
         Agent::Codex => parse_codex_session(&path, session_id, project),
+        Agent::Gemini => parse_gemini_session(&path, session_id, project),
     }
 }
 

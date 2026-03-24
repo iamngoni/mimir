@@ -2,13 +2,13 @@
 
 > *In Norse mythology, Mimir is the keeper of wisdom — the one the gods consult when they need to know what has come before.*
 
-**Mimir** is an MCP (Model Context Protocol) server that lets AI coding agents share session context with each other. It reads existing session files written by Claude Code and Codex CLI, parses them into structured data, and exposes them as MCP tools.
+**Mimir** is an MCP (Model Context Protocol) server that lets AI coding agents share session context with each other. It reads existing session files written by Claude Code, Codex CLI, and Gemini CLI, parses them into structured data, and exposes them as MCP tools.
 
 No storage. No LLM calls. Just intelligent parsing of what your agents already write to disk.
 
 ## Why
 
-Claude Code and Codex work in isolation by default. Each session starts cold, with no knowledge of what the other agent did. Mimir bridges that gap — an agent can call `list_sessions` or `get_session_summary` to understand what happened in a prior session before picking up work.
+Claude Code, Codex, and Gemini work in isolation by default. Each session starts cold, with no knowledge of what the other agent did. Mimir bridges that gap — an agent can call `list_sessions` or `get_session_summary` to understand what happened in a prior session before picking up work.
 
 ## Tools
 
@@ -18,12 +18,12 @@ List available sessions for a given project path and optional agent filter.
 ```json
 {
   "project_path": "/home/user/myproject",
-  "agent": "claude-code"  // optional: "claude-code" | "codex"
+  "agent": "claude-code"  // optional: "claude-code" | "codex" | "gemini"
 }
 ```
 
 ### `get_session_summary`
-Parse a session JSONL file and return structured data about what happened — initial prompt, files modified, tool calls made, errors, and final state.
+Parse a session file and return structured data about what happened — initial prompt, files modified, tool calls made, errors, and final state.
 
 ```json
 {
@@ -37,7 +37,8 @@ Parse a session JSONL file and return structured data about what happened — in
 | Agent | Path |
 |-------|------|
 | Claude Code | `~/.claude/projects/<encoded-path>/<uuid>.jsonl` |
-| Codex | `~/.codex/sessions/<uuid>.jsonl` |
+| Codex | `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<date>-<uuid>.jsonl` |
+| Gemini | `~/.gemini/tmp/<project-alias>/chats/session-<date>-<uuid>.json` |
 
 ## Installation
 
@@ -82,10 +83,24 @@ command = "mimir"
 args = []
 ```
 
+### Gemini CLI
+
+Manually add to `~/.gemini/settings.json`:
+```json
+{
+  "mcpServers": {
+    "mimir": {
+      "command": "mimir",
+      "args": []
+    }
+  }
+}
+```
+
 ## Tech Stack
 
 - Rust + `rmcp` (MCP SDK)
-- `serde_json` for JSONL parsing
+- `serde_json` for JSONL/JSON parsing
 - `walkdir` for session discovery
 - stdio transport only
 

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum Agent {
     ClaudeCode,
     Codex,
+    Gemini,
 }
 
 impl std::fmt::Display for Agent {
@@ -15,6 +16,7 @@ impl std::fmt::Display for Agent {
         match self {
             Agent::ClaudeCode => write!(f, "claude-code"),
             Agent::Codex => write!(f, "codex"),
+            Agent::Gemini => write!(f, "gemini"),
         }
     }
 }
