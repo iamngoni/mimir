@@ -1,13 +1,22 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::model::{
+    AnnotateAble, ErrorData as McpError, ListResourceTemplatesResult, ListResourcesResult,
+    PaginatedRequestParams, RawResource, RawResourceTemplate, ReadResourceRequestParams,
+    ReadResourceResult, ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities,
+    ServerInfo, SubscribeRequestParams,
+};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::{tool, tool_handler, tool_router, Peer, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::models::Agent;
-use crate::notes;
-use crate::sessions;
+use crate::resources;
+use crate::{notes, sessions};
 
 // ── Tool parameter types ──────────────────────────────────────────────
 
@@ -116,20 +125,26 @@ pub struct GetNotesRequest {
 
 // ── Server ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MimirServer {
     tool_router: ToolRouter<Self>,
+    /// Subscribed resource URIs → last-seen content hash, for change detection.
+    subscriptions: Arc<Mutex<HashMap<String, String>>>,
+    /// The connected client peer, captured on first subscribe, used to push
+    /// `resources/updated` notifications from the background watcher.
+    peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
+}
+
+impl std::fmt::Debug for MimirServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MimirServer").finish_non_exhaustive()
+    }
 }
 
 fn parse_agent(s: &str) -> Result<Agent, String> {
-    match s {
-        "claude-code" => Ok(Agent::ClaudeCode),
-        "codex" => Ok(Agent::Codex),
-        "gemini" => Ok(Agent::Gemini),
-        other => Err(format!(
-            "Unknown agent: {other}. Use \"claude-code\", \"codex\", or \"gemini\"."
-        )),
-    }
+    Agent::from_kebab(s).ok_or_else(|| {
+        format!("Unknown agent: {s}. Use \"claude-code\", \"codex\", or \"gemini\".")
+    })
 }
 
 #[tool_router]
@@ -363,12 +378,133 @@ impl MimirServer {
 #[tool_handler]
 impl ServerHandler for MimirServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Mimir — share session context between AI coding agents. \
-                 Use list_sessions to discover sessions, then get_session_summary \
-                 for details.",
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .enable_resources_list_changed()
+                .build(),
+        )
+        .with_instructions(
+            "Mimir — share session context between AI coding agents. Use \
+             get_project_context or search_sessions to catch up, get_session_summary \
+             (+ get_session_chunk) for detail, and leave_note for handoffs. Sessions \
+             and notes are also exposed as resources you can read and subscribe to.",
+        )
+    }
+
+    /// List every session (across all agents/projects) plus per-project notes as
+    /// resources.
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let mut items = Vec::new();
+
+        let sessions = sessions::list_all_sessions()
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        for s in sessions {
+            let uri = resources::session_uri(s.agent, &s.session_id, &s.project_path);
+            let short: String = s.session_id.chars().take(8).collect();
+            let name = format!("{} · {short}", s.agent);
+            let description = format!(
+                "{} session in {} (modified {})",
+                s.agent,
+                s.project_path,
+                s.modified_at.to_rfc3339()
+            );
+            items.push(
+                RawResource::new(uri, name)
+                    .with_description(description)
+                    .with_mime_type("application/json")
+                    .no_annotation(),
+            );
+        }
+
+        if let Ok(projects) = notes::list_note_projects() {
+            for p in projects {
+                items.push(
+                    RawResource::new(resources::notes_uri(&p), format!("notes · {p}"))
+                        .with_description(format!("Handoff notes for {p}"))
+                        .with_mime_type("application/json")
+                        .no_annotation(),
+                );
+            }
+        }
+
+        Ok(ListResourcesResult::with_all_items(items))
+    }
+
+    /// Advertise the URI shapes clients can construct directly.
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        let templates = vec![
+            RawResourceTemplate::new(
+                "mimir://session/{agent}/{session_id}?project={project_path}",
+                "Session",
             )
+            .with_description(
+                "A parsed coding-agent session. agent ∈ {claude-code, codex, gemini}.",
+            )
+            .with_mime_type("application/json")
+            .no_annotation(),
+            RawResourceTemplate::new("mimir://notes/{project_path}", "Project notes")
+                .with_description("Handoff notes left for a project.")
+                .with_mime_type("application/json")
+                .no_annotation(),
+        ];
+        Ok(ListResourceTemplatesResult::with_all_items(templates))
+    }
+
+    /// Read a session (compact summary) or a project's notes as JSON.
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let json = resources::read_content(&request.uri)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(json, request.uri).with_mime_type("application/json"),
+        ]))
+    }
+
+    /// Subscribe to change notifications for a resource. Records the current
+    /// content hash so the background watcher can detect later changes.
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        if resources::parse_uri(&request.uri).is_none() {
+            return Err(McpError::invalid_params(
+                format!("Not a mimir resource URI: {}", request.uri),
+                None,
+            ));
+        }
+        // Capture the peer so the watcher can push notifications.
+        *self.peer.lock().unwrap() = Some(context.peer.clone());
+
+        let hash = resources::uri_to_path(&request.uri)
+            .and_then(|p| sessions::file_hash(&p).ok())
+            .unwrap_or_default();
+        self.subscriptions.lock().unwrap().insert(request.uri, hash);
+        Ok(())
+    }
+
+    /// Stop receiving change notifications for a resource.
+    async fn unsubscribe(
+        &self,
+        request: rmcp::model::UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.subscriptions.lock().unwrap().remove(&request.uri);
+        Ok(())
     }
 }
 
@@ -376,6 +512,46 @@ impl MimirServer {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            peer: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Spawn a background task that polls subscribed resources and pushes a
+    /// `resources/updated` notification whenever the underlying file changes.
+    pub fn spawn_resource_watcher(&self) {
+        let subscriptions = self.subscriptions.clone();
+        let peer = self.peer.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                // Snapshot under the lock; never hold it across an await.
+                let snapshot: Vec<(String, String)> = {
+                    let guard = subscriptions.lock().unwrap();
+                    guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                };
+                if snapshot.is_empty() {
+                    continue;
+                }
+                let Some(peer) = peer.lock().unwrap().clone() else {
+                    continue;
+                };
+
+                for (uri, last_hash) in snapshot {
+                    let current = resources::uri_to_path(&uri)
+                        .and_then(|p| sessions::file_hash(&p).ok());
+                    if let Some(current) = current {
+                        if current != last_hash {
+                            subscriptions.lock().unwrap().insert(uri.clone(), current);
+                            let _ = peer
+                                .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
+                                .await;
+                        }
+                    }
+                }
+            }
+        });
     }
 }

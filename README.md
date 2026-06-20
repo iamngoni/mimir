@@ -115,6 +115,17 @@ Notes are the one **writable** surface — durable context one agent leaves for 
 }
 ```
 
+## Resources
+
+Beyond tools, Mimir exposes sessions and notes as MCP **resources**, so clients with a resource picker can browse and attach them directly, and subscribe to live updates.
+
+- **`resources/list`** — every session across all agents/projects, plus a notes resource per project.
+- **`resources/templates/list`** — advertises the URI shapes:
+  - `mimir://session/{agent}/{session_id}?project={project_path}`
+  - `mimir://notes/{project_path}`
+- **`resources/read`** — returns the compact session summary (or the project's notes) as JSON. URIs are stable, so a client can read any of them directly.
+- **`resources/subscribe`** — get a `notifications/resources/updated` when a session file (or the notes DB) changes. Mimir polls subscribed resources by content hash in the background.
+
 ## Session File Locations
 
 | Agent | Path |
@@ -190,9 +201,9 @@ Mimir reads agent session logs (it never writes to them). The only data Mimir it
 - `serde_json` for JSONL/JSON parsing
 - `walkdir` for session discovery
 - `tiktoken-rs` (cl100k_base) for transcript token counting / chunking
-- `sha2` for chunk drift detection
+- `sha2` for chunk drift detection + resource change detection
 - `rusqlite` (bundled SQLite) for handoff notes
-- stdio transport only
+- Tools **and** resources (with subscriptions); stdio transport only
 
 ## License
 

@@ -21,6 +21,18 @@ impl std::fmt::Display for Agent {
     }
 }
 
+impl Agent {
+    /// Parse a kebab-case agent label ("claude-code" | "codex" | "gemini").
+    pub fn from_kebab(s: &str) -> Option<Agent> {
+        match s {
+            "claude-code" => Some(Agent::ClaudeCode),
+            "codex" => Some(Agent::Codex),
+            "gemini" => Some(Agent::Gemini),
+            _ => None,
+        }
+    }
+}
+
 /// Metadata about a discovered session file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {

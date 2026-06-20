@@ -1,5 +1,6 @@
 mod models;
 mod notes;
+mod resources;
 mod server;
 mod sessions;
 
@@ -20,6 +21,8 @@ async fn main() -> Result<()> {
     tracing::info!("Starting Mimir MCP server");
 
     let server = MimirServer::new();
+    // Background watcher that emits resources/updated for subscribed sessions.
+    server.spawn_resource_watcher();
     let transport = rmcp::transport::stdio();
 
     // Serve the MCP server over stdio and wait for it to finish

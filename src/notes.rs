@@ -23,6 +23,25 @@ fn db_path() -> Result<PathBuf> {
     Ok(dir.join("mimir.db"))
 }
 
+/// Public accessor for the notes database path (used by the resources layer for
+/// subscription change detection).
+pub fn database_path() -> Result<PathBuf> {
+    db_path()
+}
+
+/// Distinct project paths that have at least one note, for resource listing.
+pub fn list_note_projects() -> Result<Vec<String>> {
+    let conn = open()?;
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT project_path FROM notes ORDER BY project_path")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut projects = Vec::new();
+    for p in rows {
+        projects.push(p?);
+    }
+    Ok(projects)
+}
+
 /// Ensure the schema exists on a connection.
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(

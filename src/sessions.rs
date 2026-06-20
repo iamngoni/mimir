@@ -254,6 +254,79 @@ pub fn list_sessions(project_path: &str, agent: Option<Agent>) -> Result<Vec<Ses
     Ok(sessions)
 }
 
+/// Discover Gemini sessions across *all* known project aliases (for global
+/// resource listing, where no single project path is supplied).
+fn discover_all_gemini_sessions() -> Result<Vec<SessionInfo>> {
+    let home = home_dir()?;
+    let projects_file = home.join(".gemini").join("projects.json");
+    let content = match fs::read_to_string(&projects_file) {
+        Ok(c) => c,
+        Err(_) => return Ok(vec![]),
+    };
+    let data: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(vec![]),
+    };
+
+    let mut sessions = Vec::new();
+    if let Some(projects) = data.get("projects").and_then(|p| p.as_object()) {
+        for path in projects.keys() {
+            sessions.extend(discover_gemini_sessions(path).unwrap_or_default());
+        }
+    }
+    Ok(sessions)
+}
+
+/// List every discoverable session across all projects and all agents. Used for
+/// the global MCP `resources/list`. This scans all agent session directories.
+pub fn list_all_sessions() -> Result<Vec<SessionInfo>> {
+    let mut sessions = Vec::new();
+
+    // Claude Code: each subdirectory of ~/.claude/projects is one (encoded) project.
+    if let Ok(home) = home_dir() {
+        let projects = home.join(".claude").join("projects");
+        if projects.exists() {
+            for entry in WalkDir::new(&projects)
+                .min_depth(1)
+                .max_depth(1)
+                .into_iter()
+                .flatten()
+            {
+                if entry.file_type().is_dir() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        // Reverse the path-encoding. This round-trips through
+                        // encode_project_path() so resolution still works even
+                        // for project names that contained hyphens.
+                        let project_path = name.replace('-', "/");
+                        sessions.extend(
+                            discover_claude_code_sessions(&project_path).unwrap_or_default(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Codex: an empty project filter returns all sessions (real cwd preserved).
+    sessions.extend(discover_codex_sessions("").unwrap_or_default());
+
+    // Gemini: walk every alias in projects.json.
+    sessions.extend(discover_all_gemini_sessions().unwrap_or_default());
+
+    sessions.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    Ok(sessions)
+}
+
+/// Public wrapper around session path resolution, for the resources layer.
+pub fn resolve_path(session_id: &str, agent: Agent, project_path: Option<&str>) -> Result<PathBuf> {
+    resolve_session_path(session_id, agent, project_path)
+}
+
+/// Public SHA-256 of a file, for subscription change detection.
+pub fn file_hash(path: &Path) -> Result<String> {
+    content_hash(path)
+}
+
 /// Resolve the file path for a session.
 fn resolve_session_path(session_id: &str, agent: Agent, project_path: Option<&str>) -> Result<PathBuf> {
     let home = home_dir()?;
