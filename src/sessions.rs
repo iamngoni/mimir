@@ -447,6 +447,7 @@ fn parse_claude_code_session(path: &Path, session_id: &str, project_path: &str) 
         errors,
         final_assistant_message,
         raw_turns: turns,
+        chunk_manifest: None,
     })
 }
 
@@ -598,6 +599,7 @@ fn parse_codex_session(path: &Path, session_id: &str, project_path: &str) -> Res
         errors,
         final_assistant_message,
         raw_turns: turns,
+        chunk_manifest: None,
     })
 }
 
@@ -747,7 +749,22 @@ fn parse_gemini_session(path: &Path, session_id: &str, project_path: &str) -> Re
         errors,
         final_assistant_message,
         raw_turns: turns,
+        chunk_manifest: None,
     })
+}
+
+/// Dispatch to the agent-specific parser for an already-resolved path.
+fn parse_session_at(
+    path: &Path,
+    session_id: &str,
+    agent: Agent,
+    project: &str,
+) -> Result<SessionSummary> {
+    match agent {
+        Agent::ClaudeCode => parse_claude_code_session(path, session_id, project),
+        Agent::Codex => parse_codex_session(path, session_id, project),
+        Agent::Gemini => parse_gemini_session(path, session_id, project),
+    }
 }
 
 /// Get a full summary of a session.
@@ -763,12 +780,405 @@ pub fn get_session_summary(
     }
 
     let project = project_path.unwrap_or("unknown");
+    parse_session_at(&path, session_id, agent, project)
+}
 
-    match agent {
-        Agent::ClaudeCode => parse_claude_code_session(&path, session_id, project),
-        Agent::Codex => parse_codex_session(&path, session_id, project),
-        Agent::Gemini => parse_gemini_session(&path, session_id, project),
+// ── Transcript chunking ───────────────────────────────────────────────
+
+/// Lazily-initialized cl100k_base tokenizer (GPT-4 / Claude-ish).
+fn tokenizer() -> &'static tiktoken_rs::CoreBPE {
+    use std::sync::OnceLock;
+    static BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
+    BPE.get_or_init(|| tiktoken_rs::cl100k_base().expect("load cl100k_base tokenizer"))
+}
+
+/// Count tokens in a string. `encode_ordinary` ignores special-token strings so
+/// arbitrary transcript content is counted safely.
+fn count_tokens(text: &str) -> usize {
+    tokenizer().encode_ordinary(text).len()
+}
+
+/// SHA-256 of a file's bytes, used to detect that a session changed between
+/// chunk fetches.
+fn content_hash(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(path).context("Failed to read session file for hashing")?;
+    let digest = Sha256::digest(&bytes);
+    Ok(format!("{digest:x}"))
+}
+
+/// Split a single oversized turn into token-bounded fragments.
+fn split_turn(turn: &Turn, size_tokens: usize) -> Vec<ChunkTurn> {
+    let tokens = tokenizer().encode_ordinary(&turn.content);
+    let mut pieces = Vec::new();
+    for window in tokens.chunks(size_tokens.max(1)) {
+        let content = tokenizer().decode(window.to_vec()).unwrap_or_default();
+        pieces.push(ChunkTurn {
+            role: turn.role.clone(),
+            content,
+            partial: true,
+        });
     }
+    pieces
+}
+
+/// Plan how a transcript splits into chunks using turn-packing: whole turns are
+/// packed up to the token budget; a single turn larger than the budget is split.
+/// This is a pure, deterministic function of `(turns, chunk_size_tokens)`.
+fn plan_chunks(turns: &[Turn], chunk_size_tokens: usize) -> Vec<Vec<ChunkTurn>> {
+    let budget = chunk_size_tokens.max(1);
+    let mut chunks: Vec<Vec<ChunkTurn>> = Vec::new();
+    let mut current: Vec<ChunkTurn> = Vec::new();
+    let mut current_tokens = 0usize;
+
+    for turn in turns {
+        let turn_tokens = count_tokens(&turn.content);
+
+        if turn_tokens > budget {
+            // Flush whatever is buffered, then emit the oversized turn as its
+            // own sequence of partial-fragment chunks.
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                current_tokens = 0;
+            }
+            for piece in split_turn(turn, budget) {
+                chunks.push(vec![piece]);
+            }
+            continue;
+        }
+
+        if current_tokens + turn_tokens > budget && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+
+        current.push(ChunkTurn {
+            role: turn.role.clone(),
+            content: turn.content.clone(),
+            partial: false,
+        });
+        current_tokens += turn_tokens;
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Build a chunk manifest for a session transcript.
+pub fn get_session_manifest(
+    session_id: &str,
+    agent: Agent,
+    project_path: Option<&str>,
+    chunk_size_tokens: usize,
+) -> Result<ChunkManifest> {
+    let path = resolve_session_path(session_id, agent, project_path)?;
+    if !path.exists() {
+        anyhow::bail!("Session file not found: {}", path.display());
+    }
+    let project = project_path.unwrap_or("unknown");
+    let summary = parse_session_at(&path, session_id, agent, project)?;
+
+    let hash = content_hash(&path)?;
+    let total_tokens: usize = summary.raw_turns.iter().map(|t| count_tokens(&t.content)).sum();
+    let chunks = plan_chunks(&summary.raw_turns, chunk_size_tokens);
+
+    Ok(ChunkManifest {
+        total_chunks: chunks.len(),
+        chunk_size_tokens,
+        total_tokens,
+        turn_count: summary.raw_turns.len(),
+        content_hash: hash,
+    })
+}
+
+/// Fetch a single chunk of a session transcript by index.
+pub fn get_session_chunk(
+    session_id: &str,
+    agent: Agent,
+    project_path: Option<&str>,
+    chunk_size_tokens: usize,
+    index: usize,
+    expected_hash: Option<&str>,
+) -> Result<SessionChunk> {
+    let path = resolve_session_path(session_id, agent, project_path)?;
+    if !path.exists() {
+        anyhow::bail!("Session file not found: {}", path.display());
+    }
+    let project = project_path.unwrap_or("unknown");
+    let summary = parse_session_at(&path, session_id, agent, project)?;
+
+    let hash = content_hash(&path)?;
+    let stale = expected_hash.map(|h| h != hash).unwrap_or(false);
+    let chunks = plan_chunks(&summary.raw_turns, chunk_size_tokens);
+    let total_chunks = chunks.len();
+
+    if index >= total_chunks {
+        anyhow::bail!(
+            "Chunk index {index} out of range (transcript has {total_chunks} chunk(s) at this size)"
+        );
+    }
+
+    let turns = chunks.into_iter().nth(index).unwrap_or_default();
+    let token_count: usize = turns.iter().map(|t| count_tokens(&t.content)).sum();
+
+    Ok(SessionChunk {
+        index,
+        total_chunks,
+        token_count,
+        content_hash: hash,
+        has_more: index + 1 < total_chunks,
+        stale,
+        turns,
+    })
+}
+
+/// Compute quantitative stats for a session, optionally with the call count for
+/// one specific tool/command (case-insensitive).
+pub fn get_session_stats(
+    session_id: &str,
+    agent: Agent,
+    project_path: Option<&str>,
+    tool: Option<&str>,
+) -> Result<SessionStats> {
+    let summary = get_session_summary(session_id, agent, project_path)?;
+
+    let user_turns = summary.raw_turns.iter().filter(|t| t.role == "user").count();
+    let assistant_turns = summary
+        .raw_turns
+        .iter()
+        .filter(|t| t.role == "assistant")
+        .count();
+    let total_tool_calls = summary.tool_calls.iter().map(|t| t.count).sum();
+    let total_tokens = summary
+        .raw_turns
+        .iter()
+        .map(|t| count_tokens(&t.content))
+        .sum();
+
+    let tool_filter = tool.map(|name| {
+        let lower = name.to_lowercase();
+        let count = summary
+            .tool_calls
+            .iter()
+            .filter(|t| t.name.to_lowercase() == lower)
+            .map(|t| t.count)
+            .sum();
+        ToolCallSummary {
+            name: name.to_string(),
+            count,
+        }
+    });
+
+    Ok(SessionStats {
+        session_id: summary.session_id,
+        agent: summary.agent,
+        project_path: summary.project_path,
+        started_at: summary.started_at,
+        turn_count: summary.turn_count,
+        user_turns,
+        assistant_turns,
+        total_tool_calls,
+        tool_calls: summary.tool_calls,
+        files_touched_count: summary.files_touched.len(),
+        error_count: summary.errors.len(),
+        total_tokens,
+        tool_filter,
+    })
+}
+
+// ── Search & aggregation ──────────────────────────────────────────────
+
+/// Build a short excerpt around the first occurrence of `needle` in `haystack`.
+fn make_snippet(haystack: &str, needle_lower: &str) -> Option<String> {
+    let lower = haystack.to_lowercase();
+    let pos = lower.find(needle_lower)?;
+    let start = pos.saturating_sub(60);
+    let end = (pos + needle_lower.len() + 60).min(haystack.len());
+    // Snap to char boundaries to avoid slicing inside a UTF-8 sequence.
+    let start = (0..=start).rev().find(|i| haystack.is_char_boundary(*i)).unwrap_or(0);
+    let end = (end..=haystack.len()).find(|i| haystack.is_char_boundary(*i)).unwrap_or(haystack.len());
+    let mut snip = String::new();
+    if start > 0 {
+        snip.push('…');
+    }
+    snip.push_str(haystack[start..end].trim());
+    if end < haystack.len() {
+        snip.push('…');
+    }
+    Some(snip)
+}
+
+/// Search sessions for a project by content substring, touched file, modified
+/// time, and/or agent. Any provided filter must match.
+pub fn search_sessions(
+    project_path: &str,
+    query: Option<&str>,
+    file: Option<&str>,
+    agent: Option<Agent>,
+    since: Option<DateTime<Utc>>,
+    limit: Option<usize>,
+) -> Result<Vec<SearchResult>> {
+    let sessions = list_sessions(project_path, agent)?;
+    let query_lower = query.map(|q| q.to_lowercase());
+    let file_lower = file.map(|f| f.to_lowercase());
+    let cap = limit.unwrap_or(usize::MAX);
+
+    let mut results = Vec::new();
+    for info in sessions {
+        if let Some(since) = since {
+            if info.modified_at < since {
+                continue;
+            }
+        }
+
+        let summary = match parse_session_at(
+            Path::new(&info.file_path),
+            &info.session_id,
+            info.agent,
+            &info.project_path,
+        ) {
+            Ok(s) => s,
+            Err(_) => continue, // skip unreadable/corrupt sessions
+        };
+
+        let mut matched_on = Vec::new();
+        let mut snippet = None;
+
+        if let Some(ql) = &query_lower {
+            // Check the initial prompt first so prompt hits get their own facet.
+            if summary
+                .initial_prompt
+                .as_deref()
+                .map(|p| p.to_lowercase().contains(ql))
+                .unwrap_or(false)
+            {
+                matched_on.push("prompt".to_string());
+            }
+            // Then scan all turn content for a body match + snippet.
+            for turn in &summary.raw_turns {
+                if turn.content.to_lowercase().contains(ql) {
+                    matched_on.push("content".to_string());
+                    snippet = make_snippet(&turn.content, ql);
+                    break;
+                }
+            }
+        }
+
+        if let Some(fl) = &file_lower {
+            if summary
+                .files_touched
+                .iter()
+                .any(|f| f.to_lowercase().contains(fl))
+            {
+                matched_on.push("file".to_string());
+            }
+        }
+
+        // A session qualifies if every provided filter matched.
+        let query_ok = query_lower.is_none()
+            || matched_on.iter().any(|m| m == "content" || m == "prompt");
+        let file_ok = file_lower.is_none() || matched_on.iter().any(|m| m == "file");
+        if !query_ok || !file_ok {
+            continue;
+        }
+
+        results.push(SearchResult {
+            session_id: info.session_id,
+            agent: info.agent,
+            project_path: info.project_path,
+            modified_at: info.modified_at,
+            file_path: info.file_path,
+            matched_on,
+            snippet,
+            files_touched: summary.files_touched,
+        });
+
+        if results.len() >= cap {
+            break;
+        }
+    }
+
+    Ok(results)
+}
+
+/// Truncate a string to at most `max` characters, appending an ellipsis.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max).collect();
+    format!("{truncated}…")
+}
+
+/// Aggregate recent cross-agent work on a project into a single digest. Notes
+/// are layered in by the caller (the server) since they live in SQLite.
+pub fn get_project_context(
+    project_path: &str,
+    agent: Option<Agent>,
+    limit: Option<usize>,
+) -> Result<ProjectContext> {
+    let sessions = list_sessions(project_path, agent)?; // already sorted newest-first
+    let cap = limit.unwrap_or(10);
+
+    let mut agents_seen: Vec<String> = Vec::new();
+    let mut recent_sessions = Vec::new();
+    let mut files_touched: Vec<String> = Vec::new();
+    let mut open_errors: Vec<String> = Vec::new();
+    let total = sessions.len();
+
+    for info in sessions.into_iter().take(cap) {
+        let agent_label = info.agent.to_string();
+        if !agents_seen.contains(&agent_label) {
+            agents_seen.push(agent_label);
+        }
+
+        let summary = match parse_session_at(
+            Path::new(&info.file_path),
+            &info.session_id,
+            info.agent,
+            &info.project_path,
+        ) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        for f in &summary.files_touched {
+            if !files_touched.contains(f) {
+                files_touched.push(f.clone());
+            }
+        }
+        for e in &summary.errors {
+            if !open_errors.contains(e) {
+                open_errors.push(e.clone());
+            }
+        }
+
+        recent_sessions.push(SessionDigest {
+            session_id: info.session_id,
+            agent: info.agent,
+            modified_at: info.modified_at,
+            initial_prompt: summary.initial_prompt.as_deref().map(|p| truncate(p, 200)),
+            final_assistant_message: summary
+                .final_assistant_message
+                .as_deref()
+                .map(|m| truncate(m, 200)),
+            tool_call_count: summary.tool_calls.iter().map(|t| t.count).sum(),
+            files_touched_count: summary.files_touched.len(),
+            error_count: summary.errors.len(),
+        });
+    }
+
+    Ok(ProjectContext {
+        project_path: project_path.to_string(),
+        session_count: total,
+        agents_seen,
+        recent_sessions,
+        files_touched,
+        open_errors,
+        notes: Vec::new(),
+    })
 }
 
 /// Extract text content from a Claude Code content array.
@@ -818,5 +1228,225 @@ fn extract_files_from_tool_input(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // ── Pure functions ────────────────────────────────────────────────
+
+    #[test]
+    fn count_tokens_is_nonzero_for_text() {
+        assert!(count_tokens("hello world") > 0);
+        assert_eq!(count_tokens(""), 0);
+    }
+
+    #[test]
+    fn content_hash_is_stable_and_distinguishing() {
+        let dir = std::env::temp_dir().join("mimir-hash-test");
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        fs::write(&a, "same content").unwrap();
+        fs::write(&b, "same content").unwrap();
+        assert_eq!(content_hash(&a).unwrap(), content_hash(&b).unwrap());
+        fs::write(&b, "different").unwrap();
+        assert_ne!(content_hash(&a).unwrap(), content_hash(&b).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_chunks_packs_small_turns_into_one() {
+        let turns = vec![
+            Turn { role: "user".into(), content: "hello world".into() },
+            Turn { role: "assistant".into(), content: "hi there friend".into() },
+        ];
+        let chunks = plan_chunks(&turns, 1000);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 2);
+        assert!(chunks[0].iter().all(|t| !t.partial));
+    }
+
+    #[test]
+    fn plan_chunks_separates_turns_that_dont_fit_together() {
+        let t1 = "alpha beta gamma delta epsilon";
+        let t2 = "one two three four five six";
+        let turns = vec![
+            Turn { role: "user".into(), content: t1.into() },
+            Turn { role: "assistant".into(), content: t2.into() },
+        ];
+        // Budget that fits either turn alone but not both together.
+        let budget = count_tokens(t1).max(count_tokens(t2));
+        let chunks = plan_chunks(&turns, budget);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|c| c.len() == 1));
+    }
+
+    #[test]
+    fn plan_chunks_splits_oversized_turn_into_partials() {
+        let content = "word ".repeat(200);
+        let turns = vec![Turn { role: "user".into(), content: content.clone() }];
+        let chunks = plan_chunks(&turns, 10);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.len() == 1 && c[0].partial));
+        let reconstructed: String = chunks.iter().map(|c| c[0].content.clone()).collect();
+        assert!(reconstructed.contains("word"));
+    }
+
+    #[test]
+    fn make_snippet_brackets_the_match() {
+        let snip = make_snippet("the quick brown fox jumps", "brown").unwrap();
+        assert!(snip.to_lowercase().contains("brown"));
+        assert!(make_snippet("nothing here", "zzz").is_none());
+    }
+
+    #[test]
+    fn truncate_respects_limit() {
+        assert_eq!(truncate("hello", 3), "hel…");
+        assert_eq!(truncate("hi", 5), "hi");
+    }
+
+    // ── Claude Code parser ────────────────────────────────────────────
+
+    const CLAUDE_FIXTURE: &str = r#"{"type":"user","message":{"content":[{"type":"text","text":"fix the auth bug"}]},"timestamp":"2026-06-20T10:00:00Z"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"looking into it"},{"type":"tool_use","name":"Read","input":{"file_path":"/src/main.rs"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/src/auth.rs"}},{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}]}}
+{"type":"tool","content":[{"is_error":true,"content":[{"text":"compile error: boom"}]}]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"fixed it"}]}}"#;
+
+    fn write_claude_fixture(session_id: &str, project: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!("mimir-home-{session_id}"));
+        let encoded = encode_project_path(project);
+        let dir = tmp.join(".claude").join("projects").join(&encoded);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{session_id}.jsonl")), CLAUDE_FIXTURE).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn parses_claude_session_fields() {
+        let path = std::env::temp_dir().join("mimir-parse-claude.jsonl");
+        fs::write(&path, CLAUDE_FIXTURE).unwrap();
+        let s = parse_claude_code_session(&path, "sess", "/proj").unwrap();
+        assert_eq!(s.initial_prompt.as_deref(), Some("fix the auth bug"));
+        assert_eq!(s.final_assistant_message.as_deref(), Some("fixed it"));
+        // 1 user + 2 assistant text turns; the tool-only message emits no turn.
+        assert_eq!(s.turn_count, 3);
+        let read = s.tool_calls.iter().find(|t| t.name == "Read").unwrap();
+        assert_eq!(read.count, 2);
+        assert!(s.files_touched.iter().any(|f| f == "/src/auth.rs"));
+        assert_eq!(s.errors.len(), 1);
+        assert!(s.errors[0].contains("boom"));
+        let _ = fs::remove_file(&path);
+    }
+
+    // ── End-to-end via a fake HOME ────────────────────────────────────
+
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_fake_home<F: FnOnce()>(home: &std::path::Path, f: F) {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        // SAFETY: HOME mutation is serialized by HOME_LOCK; restored after `f`.
+        unsafe { std::env::set_var("HOME", home) };
+        f();
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("HOME", p),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn end_to_end_claude_code_flow() {
+        let project = "/work/myproj";
+        let session_id = "e2e-session";
+        let home = write_claude_fixture(session_id, project);
+
+        with_fake_home(&home, || {
+            // list_sessions discovers it
+            let listed = list_sessions(project, Some(Agent::ClaudeCode)).unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].session_id, session_id);
+
+            // stats
+            let stats =
+                get_session_stats(session_id, Agent::ClaudeCode, Some(project), Some("Read"))
+                    .unwrap();
+            assert_eq!(stats.user_turns, 1);
+            assert_eq!(stats.assistant_turns, 2); // tool-only message emits no turn
+            assert_eq!(stats.total_tool_calls, 3); // Read x2 + Bash x1
+            assert_eq!(stats.tool_filter.unwrap().count, 2);
+            assert!(stats.total_tokens > 0);
+
+            // manifest + chunk round-trip
+            let manifest =
+                get_session_manifest(session_id, Agent::ClaudeCode, Some(project), 1000).unwrap();
+            assert!(manifest.total_chunks >= 1);
+            assert_eq!(manifest.content_hash.len(), 64); // sha256 hex
+            let chunk = get_session_chunk(
+                session_id,
+                Agent::ClaudeCode,
+                Some(project),
+                1000,
+                0,
+                Some(&manifest.content_hash),
+            )
+            .unwrap();
+            assert!(!chunk.stale);
+            assert!(!chunk.turns.is_empty());
+
+            // stale detection
+            let stale = get_session_chunk(
+                session_id,
+                Agent::ClaudeCode,
+                Some(project),
+                1000,
+                0,
+                Some("deadbeef"),
+            )
+            .unwrap();
+            assert!(stale.stale);
+
+            // out-of-range index errors
+            assert!(get_session_chunk(
+                session_id,
+                Agent::ClaudeCode,
+                Some(project),
+                1000,
+                999,
+                None
+            )
+            .is_err());
+
+            // search by content and by file
+            let by_content =
+                search_sessions(project, Some("auth"), None, None, None, None).unwrap();
+            assert_eq!(by_content.len(), 1);
+            assert!(by_content[0].matched_on.iter().any(|m| m == "prompt"));
+
+            let by_file =
+                search_sessions(project, None, Some("auth.rs"), None, None, None).unwrap();
+            assert_eq!(by_file.len(), 1);
+            assert!(by_file[0].matched_on.iter().any(|m| m == "file"));
+
+            let no_match =
+                search_sessions(project, Some("nonexistent-xyz"), None, None, None, None).unwrap();
+            assert!(no_match.is_empty());
+
+            // project context aggregation
+            let ctx = get_project_context(project, None, None).unwrap();
+            assert_eq!(ctx.session_count, 1);
+            assert_eq!(ctx.recent_sessions.len(), 1);
+            assert!(ctx.agents_seen.iter().any(|a| a == "claude-code"));
+            assert!(ctx.files_touched.iter().any(|f| f == "/src/main.rs"));
+            assert!(!ctx.open_errors.is_empty());
+        });
+
+        let _ = fs::remove_dir_all(&home);
     }
 }

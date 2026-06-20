@@ -30,6 +30,15 @@ schemars = "1"
 anyhow = "1"
 thiserror = "2"
 
+# Token counting for transcript chunking
+tiktoken-rs = "0.6"
+
+# Content hashing for chunk drift detection
+sha2 = "0.10"
+
+# Notes storage (handoff between agents); bundled avoids a system sqlite dependency
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,4 +1,5 @@
 mod models;
+mod notes;
 mod server;
 mod sessions;
 
