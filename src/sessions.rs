@@ -82,16 +82,23 @@ fn discover_codex_sessions(project_path: &str) -> Result<Vec<SessionInfo>> {
                     .to_string()
             });
 
-            // Filter by project_path: match if cwd starts with the project path
-            let session_project = cwd.as_deref().unwrap_or("");
-            if !session_project.is_empty() && !session_project.starts_with(project_path) {
-                continue;
+            // Filter by project_path. An empty `project_path` means "all
+            // projects" (the global scan), so everything is kept. For a specific
+            // project we require the session's cwd to be known AND match —
+            // otherwise a session whose cwd we can't read (e.g. an empty or
+            // metadata-less file) would be wrongly attributed to whatever
+            // project was queried, and would show up under every project.
+            if !project_path.is_empty() {
+                match cwd.as_deref() {
+                    Some(c) if c.starts_with(project_path) => {}
+                    _ => continue,
+                }
             }
 
             sessions.push(SessionInfo {
                 session_id,
                 agent: Agent::Codex,
-                project_path: cwd.unwrap_or_else(|| project_path.to_string()),
+                project_path: cwd.unwrap_or_else(|| "unknown".to_string()),
                 modified_at,
                 file_path: path.to_string_lossy().to_string(),
             });
@@ -1520,6 +1527,46 @@ mod tests {
             assert!(!ctx.open_errors.is_empty());
         });
 
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    // ── Codex project attribution (regression) ────────────────────────
+
+    fn write_codex_fixtures(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!("mimir-codex-{tag}"));
+        let dir = home.join(".codex").join("sessions").join("2026").join("06").join("20");
+        fs::create_dir_all(&dir).unwrap();
+
+        // A real session with a known cwd belonging to /work/Keel.
+        let meta = r#"{"type":"session_meta","payload":{"id":"019edb0d-keel","cwd":"/work/Keel"},"timestamp":"2026-06-20T08:00:00Z"}"#;
+        fs::write(dir.join("rollout-2026-06-20T08-00-00-019edb0d-keel.jsonl"), meta).unwrap();
+
+        // An empty/metadata-less file (0 bytes) — cwd is unknowable. This is the
+        // file that used to be wrongly attributed to every project.
+        fs::write(dir.join("rollout-2026-01-24T08-36-46-019beeb8-empty.jsonl"), "").unwrap();
+
+        home
+    }
+
+    #[test]
+    fn codex_unknown_cwd_not_attributed_to_a_specific_project() {
+        let home = write_codex_fixtures("attr");
+        with_fake_home(&home, || {
+            // Querying Keel returns only the real Keel session, not the empty file.
+            let keel = discover_codex_sessions("/work/Keel").unwrap();
+            assert_eq!(keel.len(), 1, "only the real Keel session should match");
+            assert_eq!(keel[0].project_path, "/work/Keel");
+
+            // A different project gets nothing — the empty file is NOT claimed.
+            let other = discover_codex_sessions("/work/Other").unwrap();
+            assert!(other.is_empty(), "empty-cwd session must not leak into other projects");
+
+            // The global scan (empty filter) still surfaces everything, with the
+            // unknown-cwd session labeled accordingly.
+            let all = discover_codex_sessions("").unwrap();
+            assert_eq!(all.len(), 2);
+            assert!(all.iter().any(|s| s.project_path == "unknown"));
+        });
         let _ = fs::remove_dir_all(&home);
     }
 }
